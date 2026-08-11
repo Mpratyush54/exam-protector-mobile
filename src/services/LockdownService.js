@@ -9,14 +9,15 @@ import {
 import NetInfo from '@react-native-community/netinfo';
 import { PermissionsAndroid, Platform } from 'react-native';
 import AudioRecord from 'react-native-audio-record';
+import { Buffer } from 'buffer';
 import { sendTcpMessage } from '../services/socket';
 
 class LockdownService {
     constructor() {
         this.subscriptions = [];
-        this.audioInterval = null;
         this.packetInterval = null;
         this.networkUnsubscribe = null;
+        this.audioDataUnsubscribe = null;
 
         this.lastAlertTime = 0;
         this.ALERT_COOLDOWN = 3000; // 3 seconds
@@ -25,7 +26,7 @@ class LockdownService {
             acc: { x: 0, y: 0, z: 0 },
             gyro: { x: 0, y: 0, z: 0 },
             mag: { x: 0, y: 0, z: 0 },
-            audioLevel: -160,
+            audioLevel: 0,
             networkState: null,
             touchCount: 0,
         };
@@ -120,12 +121,31 @@ class LockdownService {
                 };
 
                 AudioRecord.init(options);
-                AudioRecord.start();
 
-                this.audioInterval = setInterval(() => {
-                    // Placeholder level
-                    this.telemetry.audioLevel = -160;
-                }, 500);
+                // Compute REAL RMS volume from the base64 PCM stream emitted by
+                // react-native-audio-record. No more hardcoded -160 placeholder.
+                this.audioDataUnsubscribe = AudioRecord.on('data', (base64Data) => {
+                    try {
+                        if (!base64Data) return;
+                        const chunk = Buffer.from(base64Data, 'base64');
+                        // PCM 16-bit little-endian mono
+                        const count = Math.floor(chunk.length / 2);
+                        if (count === 0) return;
+
+                        let sumSquares = 0;
+                        for (let i = 0; i < count; i++) {
+                            const sample = chunk.readInt16LE(i * 2);
+                            sumSquares += sample * sample;
+                        }
+                        const rms = Math.sqrt(sumSquares / count);
+                        // Normalize to 0..1 (16-bit max amplitude is 32767)
+                        this.telemetry.audioLevel = Math.min(rms / 32767.0, 1.0);
+                    } catch (e) {
+                        console.warn('[Lockdown] Audio decode error:', e.message);
+                    }
+                });
+
+                AudioRecord.start();
             }
         } catch (e) {
             console.warn("Audio monitoring failed:", e);
@@ -158,7 +178,10 @@ class LockdownService {
             console.warn("Audio stop error:", e);
         }
 
-        if (this.audioInterval) clearInterval(this.audioInterval);
+        if (this.audioDataUnsubscribe) {
+            try { this.audioDataUnsubscribe.remove(); } catch (e) { }
+            this.audioDataUnsubscribe = null;
+        }
         if (this.packetInterval) clearInterval(this.packetInterval);
         if (this.networkUnsubscribe) this.networkUnsubscribe();
     }

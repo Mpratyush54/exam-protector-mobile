@@ -9,6 +9,7 @@ class WSFrameService {
     constructor() {
         this.socket = null;
         this.cameraRef = null;
+        this.cameraType = 'front';
         this.isCapturing = false;
         this.frameCount = 0;
         this.capturing = false; // Lock to prevent overlapping captures
@@ -18,8 +19,9 @@ class WSFrameService {
      * Start capturing and sending frames
      * @param {object} socket - The WebSocket connection proxy
      * @param {object} cameraRef - React ref to CameraKit Camera component
+     * @param {string} cameraType - 'front' (room/face) or 'back' (desk view)
      */
-    start(socket, cameraRef) {
+    start(socket, cameraRef, cameraType = 'front') {
         if (this.isCapturing) {
             console.log('[WSFrame] Already capturing');
             return;
@@ -27,12 +29,18 @@ class WSFrameService {
 
         this.socket = socket;
         this.cameraRef = cameraRef;
+        this.cameraType = cameraType;
         this.isCapturing = true;
         this.frameCount = 0;
         this.capturing = false;
 
         console.log('[WSFrame] Starting silent frame capture loop');
         this._captureLoop();
+    }
+
+    setCameraType(cameraType) {
+        this.cameraType = cameraType;
+        console.log(`[WSFrame] Camera type now: ${cameraType}`);
     }
 
     async _captureLoop() {
@@ -71,7 +79,7 @@ class WSFrameService {
 
             const payload = JSON.stringify({
                 type: 'VIDEO_FRAME',
-                data: { image: base64Data }
+                data: { image: base64Data, camera: this.cameraType }
             });
             this.socket.send(payload);
 

@@ -1,10 +1,10 @@
 import React, { useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
-import { StyleSheet, View, Text } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity } from 'react-native';
 import { Camera } from 'react-native-camera-kit';
-import { BatteryCharging, EyeOff } from 'lucide-react-native';
+import { BatteryCharging, EyeOff, RefreshCcw } from 'lucide-react-native';
 import SystemSetting from 'react-native-system-setting';
 
-const CameraStream = forwardRef(({ isActive }, ref) => {
+const CameraStream = forwardRef(({ isActive, cameraType = 'front', onToggleCamera }, ref) => {
     const cameraRef = useRef(null);
 
     // Expose camera ref to parent for frame capture
@@ -40,15 +40,28 @@ const CameraStream = forwardRef(({ isActive }, ref) => {
         };
     }, [isActive]);
 
+    const isFront = cameraType === 'front';
+
     return (
         <View style={styles.container}>
             {/* Camera-Kit Camera (always used - works with WS fallback) */}
             <Camera
                 ref={cameraRef}
                 style={styles.camera}
-                cameraType="front"
+                cameraType={cameraType}
                 flashMode="off"
             />
+
+            {/* Camera switch button (desk view = rear, room view = front) */}
+            <TouchableOpacity
+                style={styles.camSwitch}
+                onPress={() => onToggleCamera && onToggleCamera()}
+            >
+                <RefreshCcw size={18} color="#fff" />
+                <Text style={styles.camSwitchText}>
+                    {isFront ? 'DESK VIEW' : 'ROOM VIEW'}
+                </Text>
+            </TouchableOpacity>
 
             {/* BLACKOUT UI */}
             <View style={styles.blackoutLayer}>
@@ -80,6 +93,26 @@ const styles = StyleSheet.create({
         flex: 1,
         width: '100%',
         height: '100%',
+    },
+    camSwitch: {
+        position: 'absolute',
+        top: 12,
+        right: 12,
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: 'rgba(0,0,0,0.55)',
+        paddingHorizontal: 10,
+        paddingVertical: 6,
+        borderRadius: 20,
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.25)',
+        zIndex: 10,
+    },
+    camSwitchText: {
+        color: '#fff',
+        fontSize: 11,
+        fontWeight: 'bold',
+        marginLeft: 6,
     },
     text: {
         color: '#666',

@@ -13,6 +13,7 @@ import TelemetryService from './src/services/TelemetryService';
 export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [serverIp, setServerIp] = useState('');
+  const [cameraType, setCameraType] = useState('front');
   const cameraRef = useRef(null);
   const socketRef = useRef(null);
 
@@ -31,17 +32,29 @@ export default function App() {
       if (cameraRef.current) {
         const camRef = cameraRef.current.getCameraRef();
         console.log('[App] Starting WS Frame Capture...');
-        WSFrameService.start(socket, camRef);
+        WSFrameService.start(socket, camRef, cameraType);
       } else {
         console.log('[App] Camera ref not ready, retrying in 2s...');
         setTimeout(() => {
           if (cameraRef.current) {
             const camRef = cameraRef.current.getCameraRef();
-            WSFrameService.start(socket, camRef);
+            WSFrameService.start(socket, camRef, cameraType);
           }
         }, 2000);
       }
     }, 1000);
+  };
+
+  // When the camera is toggled (front <-> rear), tag future frames so the
+  // backend can distinguish DESK view (rear) from ROOM/face view (front).
+  useEffect(() => {
+    if (socketRef.current && WSFrameService.isCapturing) {
+      WSFrameService.setCameraType(cameraType);
+    }
+  }, [cameraType]);
+
+  const handleToggleCamera = () => {
+    setCameraType(prev => (prev === 'front' ? 'back' : 'front'));
   };
 
   const handleConnect = (ip) => {
@@ -86,10 +99,16 @@ export default function App() {
         if (parsed.type === 'WEBRTC_ANSWER') {
           console.log('[App] Received WEBRTC_ANSWER from server');
           WebRTCService.handleAnswer(parsed.data);
-        } else if (parsed.type === 'START_WS_FRAMES') {
-          // Server confirmed fallback mode
-          console.log('[App] Server confirmed WS Frame mode');
-          startWSFrameCapture(socket);
+} else if (parsed.type === 'START_WS_FRAMES') {
+            // Server confirmed fallback mode
+            console.log('[App] Server confirmed WS Frame mode');
+            startWSFrameCapture(socket);
+        } else if (parsed.type === 'SET_CAMERA') {
+            const target = parsed.data && parsed.data.camera;
+            if (target === 'front' || target === 'back') {
+                console.log('[App] Server requested camera:', target);
+                setCameraType(target);
+            }
         }
       } catch (e) { }
     });
@@ -116,7 +135,12 @@ export default function App() {
           </View>
 
           <View style={styles.cameraContainer}>
-            <CameraStream ref={cameraRef} isActive={isConnected} />
+            <CameraStream
+              ref={cameraRef}
+              isActive={isConnected}
+              cameraType={cameraType}
+              onToggleCamera={handleToggleCamera}
+            />
           </View>
 
           <View style={styles.infoPanel}>
