@@ -1,207 +1,258 @@
-import { StyleSheet, View, Text, SafeAreaView, Platform, StatusBar } from 'react-native';
-import { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+    Linking, NativeModules, PermissionsAndroid, Platform, SafeAreaView, ScrollView, StatusBar, StyleSheet,
+    Text, TouchableOpacity, View,
+} from 'react-native';
+import { AudioLines, Camera, Radio, ShieldCheck, Wifi } from 'lucide-react-native';
+import KeepAwake from 'react-native-keep-awake';
 import ConnectScreen from './src/screens/ConnectScreen';
 import CameraStream from './src/components/CameraView';
 import NetworkStatus from './src/components/NetworkStatus';
-import { connectSocket, getSocket } from './src/services/socket';
-import KeepAwake from 'react-native-keep-awake';
+import { connectSocket, disconnectSocket } from './src/services/socket';
 import { lockdownService } from './src/services/LockdownService';
 import WebRTCService from './src/services/WebRTCService';
 import WSFrameService from './src/services/WSFrameService';
-import TelemetryService from './src/services/TelemetryService';
+import { palette, ui } from './src/theme';
+
+async function requestCamera() {
+    if (Platform.OS === 'android') {
+        return await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA)
+            === PermissionsAndroid.RESULTS.GRANTED;
+    }
+    return NativeModules.CKCameraManager.requestDeviceCameraAuthorization();
+}
+
+function stopAttempt(attempt) {
+    attempt.active = false;
+    clearTimeout(attempt.connectTimeout);
+    clearTimeout(attempt.audioTimeout);
+    disconnectSocket();
+    WSFrameService.stop();
+    WebRTCService.stop();
+    lockdownService.stopMonitoring();
+}
 
 export default function App() {
-  const [isConnected, setIsConnected] = useState(false);
-  const [serverIp, setServerIp] = useState('');
-  const [cameraType, setCameraType] = useState('front');
-  const cameraRef = useRef(null);
-  const socketRef = useRef(null);
+    const [connection, setConnection] = useState({ kind: 'idle' });
+    const [cameraPermission, setCameraPermission] = useState('Checking permission');
+    const [video, setVideo] = useState('Waiting for camera');
+    const [audio, setAudio] = useState('Starting microphone');
+    const [motion, setMotion] = useState('Waiting for sensors');
+    const [cameraType, setCameraType] = useState('front');
+    const [cameraRevision, setCameraRevision] = useState(0);
+    const [settingsError, setSettingsError] = useState(false);
+    const lens = useRef('front');
+    const attemptRef = useRef(null);
+    const cameraRef = useRef(null);
 
-  // Lifecycle for sensors
-  useEffect(() => {
-    if (isConnected) {
-      lockdownService.startMonitoring();
-    } else {
-      lockdownService.stopMonitoring();
+    useEffect(() => () => {
+        if (attemptRef.current) stopAttempt(attemptRef.current);
+    }, []);
+
+    function changeCamera(type) {
+        lens.current = type;
+        setCameraType(type);
     }
-  }, [isConnected]);
 
-  const startWSFrameCapture = (socket) => {
-    // Small delay to let camera initialize
-    setTimeout(() => {
-      if (cameraRef.current) {
-        const camRef = cameraRef.current.getCameraRef();
-        console.log('[App] Starting WS Frame Capture...');
-        WSFrameService.start(socket, camRef, cameraType);
-      } else {
-        console.log('[App] Camera ref not ready, retrying in 2s...');
-        setTimeout(() => {
-          if (cameraRef.current) {
-            const camRef = cameraRef.current.getCameraRef();
-            WSFrameService.start(socket, camRef, cameraType);
-          }
-        }, 2000);
-      }
-    }, 1000);
-  };
-
-  // When the camera is toggled (front <-> rear), tag future frames so the
-  // backend can distinguish DESK view (rear) from ROOM/face view (front).
-  useEffect(() => {
-    if (socketRef.current && WSFrameService.isCapturing) {
-      WSFrameService.setCameraType(cameraType);
+    function finish(attempt, message) {
+        if (!attempt?.active) return;
+        stopAttempt(attempt);
+        attemptRef.current = null;
+        setConnection({ kind: message ? 'error' : 'idle', address: attempt.address, message });
     }
-  }, [cameraType]);
 
-  const handleToggleCamera = () => {
-    setCameraType(prev => (prev === 'front' ? 'back' : 'front'));
-  };
+    useEffect(() => {
+        const attempt = attemptRef.current;
+        if (connection.kind !== 'connected' || cameraPermission !== 'granted' || !attempt?.active) return;
+        setVideo('Waiting for camera');
+        WSFrameService.start(attempt.socket, () => cameraRef.current?.capture(), () => lens.current, setVideo);
+        return () => WSFrameService.stop();
+    }, [connection, cameraPermission, cameraType, cameraRevision]);
 
-  const handleConnect = (ip) => {
-    setServerIp(ip);
-    const socket = connectSocket(ip);
-    socketRef.current = socket;
-
-    // Listen for successful connection
-    socket.on('connect', async () => {
-      setIsConnected(true);
-
-      // I. Start WebRTC for audio only (may fail, that's OK)
-      try {
-        await WebRTCService.start(socket);
-      } catch (e) {
-        console.error("WebRTC audio failed:", e);
-      }
-
-      // II. Start TCP Telemetry
-      try {
-        TelemetryService.connect(ip, 5001);
-      } catch (e) {
-        console.error("Telemetry failed:", e);
-      }
-
-      // III. Start WS Video Frames immediately (don't wait for WebRTC)
-      console.log('[App] Starting WS Frame capture...');
-      startWSFrameCapture(socket);
-    });
-
-    socket.on('close', () => {
-      setIsConnected(false);
-      WebRTCService.stop();
-      WSFrameService.stop();
-      TelemetryService.disconnect();
-    });
-
-    // Handle messages from Server
-    socket.on('data', (msg) => {
-      try {
-        const parsed = JSON.parse(msg);
-        if (parsed.type === 'WEBRTC_ANSWER') {
-          console.log('[App] Received WEBRTC_ANSWER from server');
-          WebRTCService.handleAnswer(parsed.data);
-} else if (parsed.type === 'START_WS_FRAMES') {
-            // Server confirmed fallback mode
-            console.log('[App] Server confirmed WS Frame mode');
-            startWSFrameCapture(socket);
-        } else if (parsed.type === 'SET_CAMERA') {
-            const target = parsed.data && parsed.data.camera;
-            if (target === 'front' || target === 'back') {
-                console.log('[App] Server requested camera:', target);
-                setCameraType(target);
-            }
+    async function startMonitoring(attempt, socket) {
+        lockdownService.startMonitoring(setMotion);
+        try {
+            const allowed = await requestCamera();
+            if (!attempt.active) return;
+            setCameraPermission(allowed ? 'granted' : 'Camera permission denied');
+        } catch {
+            if (attempt.active) setCameraPermission('Camera permission unavailable');
         }
-      } catch (e) { }
-    });
-  };
+        if (!attempt.active) return;
 
-  const handleTouch = () => {
-    if (isConnected) {
-      lockdownService.reportTouch({ nativeEvent: { locationX: 0, locationY: 0 } });
+        try {
+            if (Platform.OS === 'android') {
+                const permission = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+                if (!attempt.active) return;
+                if (permission !== PermissionsAndroid.RESULTS.GRANTED) {
+                    setAudio('Microphone permission denied');
+                    return;
+                }
+            }
+            const fallback = () => {
+                if (!attempt.active || attempt.usingAudioMeter) return;
+                attempt.usingAudioMeter = true;
+                clearTimeout(attempt.audioTimeout);
+                WebRTCService.stop();
+                attempt.audioTimeout = setTimeout(() => {
+                    lockdownService.stopAudioMeter();
+                    setAudio('Audio unavailable');
+                }, 4000);
+                setAudio('Starting sound level meter');
+                try {
+                    lockdownService.startAudioMeter(() => {
+                        clearTimeout(attempt.audioTimeout);
+                        setAudio('Sending sound levels');
+                    });
+                } catch {
+                    clearTimeout(attempt.audioTimeout);
+                    lockdownService.stopAudioMeter();
+                    setAudio('Audio unavailable');
+                }
+            };
+            attempt.audioTimeout = setTimeout(fallback, 12000);
+            attempt.audioFallback = fallback;
+            void WebRTCService.start(socket, state => {
+                if (!attempt.active) return;
+                if (state === 'Audio unavailable') fallback();
+                else {
+                    clearTimeout(attempt.audioTimeout);
+                    setAudio(state);
+                }
+            });
+        } catch {
+            if (attempt.active) setAudio('Microphone unavailable');
+        }
     }
-  };
 
-  return (
-    <View style={styles.container} onTouchStart={handleTouch}>
-      <StatusBar barStyle="light-content" backgroundColor="#000000" />
-      {isConnected && <KeepAwake />}
+    function handleConnect(address) {
+        if (attemptRef.current) return;
+        const attempt = { address, active: true };
+        attemptRef.current = attempt;
+        setConnection({ kind: 'connecting', address });
+        try {
+            const socket = connectSocket(address);
+            attempt.socket = socket;
+            attempt.connectTimeout = setTimeout(
+                () => finish(attempt, 'The computer did not respond. Check the address and try again.'), 8000,
+            );
+            socket.onopen = () => {
+                if (!attempt.active) return;
+                clearTimeout(attempt.connectTimeout);
+                setCameraPermission('Checking permission');
+                setVideo('Waiting for camera');
+                setAudio('Starting microphone');
+                setMotion('Waiting for sensors');
+                setSettingsError(false);
+                changeCamera('front');
+                setConnection({ kind: 'connected', address });
+                void startMonitoring(attempt, socket).catch(() => {
+                    if (attempt.active) finish(attempt, 'Monitoring could not start. Reconnect to try again.');
+                });
+            };
+            socket.onerror = () => finish(attempt, 'Unable to reach the exam computer. Check your network and try again.');
+            socket.onclose = () => finish(attempt, 'Connection closed. Reconnect to resume monitoring.');
+            socket.onmessage = ({ data }) => {
+                if (!attempt.active) return;
+                let message;
+                try { message = JSON.parse(data); } catch { return; }
+                if (message?.type === 'WEBRTC_ANSWER') {
+                    void WebRTCService.handleAnswer(message.data).catch(() => attempt.audioFallback?.());
+                }
+                if (message?.type === 'SET_CAMERA' && ['front', 'back'].includes(message.data?.camera)) {
+                    changeCamera(message.data.camera);
+                }
+            };
+        } catch {
+            finish(attempt, 'Connection could not be opened. Check the computer address.');
+        }
+    }
 
-      {!isConnected ? (
-        <ConnectScreen onConnect={handleConnect} />
-      ) : (
-        <SafeAreaView style={styles.mainContainer}>
-          <View style={styles.header}>
-            <Text style={styles.headerTitle}>Proctor Active</Text>
-            <View style={styles.statusDot} />
-          </View>
-
-          <View style={styles.cameraContainer}>
-            <CameraStream
-              ref={cameraRef}
-              isActive={isConnected}
-              cameraType={cameraType}
-              onToggleCamera={handleToggleCamera}
-            />
-          </View>
-
-          <View style={styles.infoPanel}>
-            <NetworkStatus />
-            <Text style={styles.serverInfo}>Connected to: {serverIp}</Text>
-          </View>
+    const connected = connection.kind === 'connected';
+    return (
+        <SafeAreaView style={ui.page}>
+            <StatusBar barStyle="dark-content" backgroundColor={palette.page} />
+            <View style={styles.header}>
+                <View style={ui.mark}><ShieldCheck color="white" size={19} /></View>
+                <Text style={ui.brandText}>Phone-Proctor</Text>
+            </View>
+            {connected ? (
+                <View style={ui.page} onTouchStart={event => lockdownService.reportTouch(event)}>
+                    <KeepAwake />
+                    <ScrollView contentContainerStyle={ui.content}>
+                        <View style={styles.intro}>
+                            <Text accessibilityRole="header" style={ui.heading}>Monitoring</Text>
+                            <Text style={ui.body}>Connected to {connection.address}</Text>
+                        </View>
+                        <View style={ui.section}>
+                            <View style={ui.row}>
+                                <Text style={[ui.label, ui.grow]}>{cameraType === 'front' ? 'Room view' : 'Desk view'}</Text>
+                                {cameraPermission === 'granted' && <TouchableOpacity accessibilityRole="button"
+                                    style={ui.secondary} onPress={() => changeCamera(cameraType === 'front' ? 'back' : 'front')}>
+                                    <Text style={ui.secondaryText}>Switch camera</Text>
+                                </TouchableOpacity>}
+                            </View>
+                            {cameraPermission === 'granted' ? <CameraStream key={`${cameraType}:${cameraRevision}`} ref={cameraRef} cameraType={cameraType} /> :
+                                <Text accessibilityLiveRegion="polite" style={ui.body}>{cameraPermission}</Text>}
+                            {video === 'Capture stalled' && <TouchableOpacity accessibilityRole="button" style={ui.secondary}
+                                onPress={() => {
+                                    setCameraRevision(revision => revision + 1);
+                                }}>
+                                <Text style={ui.secondaryText}>Restart camera</Text>
+                            </TouchableOpacity>}
+                        </View>
+                        <View>
+                            <Text accessibilityRole="header" style={ui.sectionLabel}>Monitoring signals</Text>
+                            <Signal icon={Camera} label="Camera" status={cameraPermission === 'granted' ? video : cameraPermission}
+                                active={video === 'Sending frames'} />
+                            <Signal icon={AudioLines} label="Microphone" status={audio}
+                                active={['Streaming audio', 'Sending sound levels'].includes(audio)} />
+                            <Signal icon={Radio} label="Motion" status={motion} active={motion === 'Sampling sensors'} />
+                            <View style={ui.item}>
+                                <View style={ui.icon}><Wifi color="white" size={17} /></View>
+                                <View style={ui.grow}>
+                                    <Text style={ui.label}>Network</Text>
+                                    <NetworkStatus style={ui.body} />
+                                </View>
+                            </View>
+                            {(cameraPermission.includes('denied') || audio.includes('denied')) &&
+                                <TouchableOpacity accessibilityRole="button" style={ui.secondary} onPress={() => {
+                                    Linking.openSettings().catch(() => setSettingsError(true));
+                                }}><Text style={ui.secondaryText}>Open permission settings</Text></TouchableOpacity>}
+                            {settingsError && <Text style={ui.error}>Open device settings to grant access, then reconnect.</Text>}
+                        </View>
+                    </ScrollView>
+                    <View style={ui.actionBar}>
+                        <View style={ui.actionGroup}>
+                            <TouchableOpacity accessibilityRole="button" style={ui.secondary}
+                                onPress={() => finish(attemptRef.current)}>
+                                <Text style={ui.secondaryText}>Disconnect</Text>
+                            </TouchableOpacity>
+                        </View>
+                    </View>
+                </View>
+            ) : (
+                <ConnectScreen connection={connection} onConnect={handleConnect}
+                    onCancel={() => finish(attemptRef.current)} />
+            )}
         </SafeAreaView>
-      )}
-    </View>
-  );
+    );
+}
+
+function Signal({ icon: Icon, label, status, active }) {
+    return (
+        <View style={ui.item}>
+            <View style={ui.icon}><Icon color="white" size={17} /></View>
+            <View style={ui.grow}>
+                <Text style={ui.label}>{label}</Text>
+                <Text accessibilityLiveRegion="polite" style={[ui.body, active && styles.active]}>{status}</Text>
+            </View>
+        </View>
+    );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#000000',
-  },
-  mainContainer: {
-    flex: 1,
-    paddingTop: Platform.OS === 'android' ? 40 : 0,
-    backgroundColor: '#000000',
-  },
-  header: {
-    padding: 16,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  headerTitle: {
-    color: '#444',
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginRight: 8,
-  },
-  statusDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: '#15803d',
-  },
-  cameraContainer: {
-    flex: 1,
-    margin: 16,
-    borderRadius: 16,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#111',
-    backgroundColor: '#000',
-  },
-  infoPanel: {
-    padding: 16,
-    backgroundColor: '#000000',
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    borderTopWidth: 1,
-    borderColor: '#111',
-  },
-  serverInfo: {
-    color: '#333',
-    textAlign: 'center',
-    marginTop: 8,
-    fontSize: 10,
-  },
+    header: { paddingHorizontal: 24, paddingTop: 15, paddingBottom: 14, flexDirection: 'row', alignItems: 'center', gap: 10, width: '100%', maxWidth: 560, alignSelf: 'center' },
+    intro: { gap: 7 },
+    active: { color: palette.good },
 });

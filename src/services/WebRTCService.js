@@ -1,117 +1,72 @@
-import {
-    RTCPeerConnection,
-    RTCIceCandidate,
-    RTCSessionDescription,
-    mediaDevices,
-} from 'react-native-webrtc';
-
-// No STUN - force LAN-only
-const configuration = {
-    iceServers: [],
-    iceTransportPolicy: 'all',
-    iceCandidatePoolSize: 0
-};
+import { RTCPeerConnection, RTCSessionDescription, mediaDevices } from 'react-native-webrtc';
 
 class WebRTCService {
-    constructor() {
-        this.pc = null;
-        this.localStream = null;
-        this.socket = null;
-        this.connected = false;
-    }
-
-    async start(socket, isFront = false) {
+    async start(socket, onState) {
+        this.stop();
         this.socket = socket;
-        console.log('[WebRTC] Starting (audio only transport)...');
+        const send = (type, data) => {
+            if (this.socket === socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type, data }));
+            }
+        };
 
-        // 1. Get Audio stream only (video is handled by CameraKit + WS now)
         try {
-            const stream = await mediaDevices.getUserMedia({
-                audio: true,
-                video: false, // Video handled by WSFrameService
-            });
-
+            const stream = await mediaDevices.getUserMedia({ audio: true, video: false });
+            if (this.socket !== socket) {
+                stream.getTracks().forEach(track => track.stop());
+                stream.release();
+                return;
+            }
             this.localStream = stream;
-            console.log('[WebRTC] Got Audio Stream');
-        } catch (err) {
-            console.error('[WebRTC] Failed to get audio', err);
-            return;
-        }
+            const pc = new RTCPeerConnection({ iceServers: [] });
+            this.pc = pc;
+            stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
-        // 2. Create Peer Connection
-        this.pc = new RTCPeerConnection(configuration);
+            const pendingCandidates = [];
+            let offerSent = false;
+            pc.onicecandidate = ({ candidate }) => {
+                if (!candidate) return;
+                if (offerSent) send('WEBRTC_CANDIDATE', candidate.toJSON());
+                else pendingCandidates.push(candidate.toJSON());
+            };
+            pc.oniceconnectionstatechange = () => {
+                if (this.pc !== pc) return;
+                if (['connected', 'completed'].includes(pc.iceConnectionState)) onState('Streaming audio');
+                else if (['failed', 'disconnected', 'closed'].includes(pc.iceConnectionState)) onState('Audio unavailable');
+            };
 
-        // 3. Add Audio Track only
-        if (this.localStream) {
-            this.localStream.getTracks().forEach(track => {
-                this.pc.addTrack(track, this.localStream);
-            });
-        }
-
-        // 4. Handle ICE Candidates
-        this.pc.onicecandidate = (event) => {
-            if (event.candidate) {
-                console.log('[WebRTC] ICE Candidate: ' + event.candidate.candidate);
-                const msg = JSON.stringify({
-                    type: 'WEBRTC_CANDIDATE',
-                    data: event.candidate.toJSON()
-                });
-                this.socket?.send(msg);
+            const offer = await pc.createOffer();
+            if (this.pc !== pc) return;
+            await pc.setLocalDescription(offer);
+            if (this.pc === pc) {
+                send('WEBRTC_OFFER', { sdp: pc.localDescription.sdp, type: pc.localDescription.type });
+                offerSent = true;
+                for (const candidate of pendingCandidates) send('WEBRTC_CANDIDATE', candidate);
+                pendingCandidates.length = 0;
             }
-        };
-
-        // 5. Monitor ICE state
-        this.pc.oniceconnectionstatechange = () => {
-            const state = this.pc?.iceConnectionState;
-            console.log(`[WebRTC] ICE State: ${state}`);
-            if (state === 'connected' || state === 'completed') {
-                this.connected = true;
-                console.log('[WebRTC] ✅ Audio connected via WebRTC');
-            }
-        };
-
-        // 6. Create Offer
-        try {
-            const offer = await this.pc.createOffer();
-            await this.pc.setLocalDescription(offer);
-
-            console.log('[WebRTC] Sending Offer');
-            this.sendSignalingMessage('WEBRTC_OFFER', {
-                sdp: this.pc.localDescription.sdp,
-                type: this.pc.localDescription.type,
-            });
-        } catch (err) {
-            console.error('[WebRTC] Offer Error', err);
-        }
-    }
-
-    sendSignalingMessage(type, data) {
-        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-            this.socket.send(JSON.stringify({ type, data }));
+        } catch {
+            if (this.socket === socket) onState('Audio unavailable');
         }
     }
 
     async handleAnswer(answer) {
-        if (!this.pc) return;
-        console.log('[WebRTC] Setting Remote Description (Answer)');
-        try {
-            await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
-        } catch (err) {
-            console.error('[WebRTC] Set Remote Desc Error', err);
-        }
+        const pc = this.pc;
+        if (!pc || !answer) return;
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
     }
 
     stop() {
-        if (this.localStream) {
-            this.localStream.getTracks().forEach(t => t.stop());
-            try { this.localStream.release(); } catch (e) { }
+        const pc = this.pc;
+        const stream = this.localStream;
+        this.socket = this.pc = this.localStream = null;
+        if (pc) {
+            pc.onicecandidate = pc.oniceconnectionstatechange = null;
+            pc.close();
         }
-        if (this.pc) {
-            this.pc.close();
+        if (stream) {
+            stream.getTracks().forEach(track => track.stop());
+            stream.release();
         }
-        this.pc = null;
-        this.localStream = null;
-        this.connected = false;
     }
 }
 

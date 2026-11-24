@@ -1,114 +1,73 @@
-/**
- * WSFrameService.js
- * Captures camera frames using react-native-camera-kit and sends them
- * over the existing WebSocket connection as base64 JPEG.
- */
 import RNFS from 'react-native-fs';
 
+const INITIAL_DELAY_MS = 1000;
+const INTERVAL_MS = 250;
+const MAX_BUFFERED_BYTES = 512 * 1024;
+const BYTES_PER_SECOND = 512 * 1024;
+const MAX_MESSAGE_BYTES = 10_000_000;
+
 class WSFrameService {
-    constructor() {
-        this.socket = null;
-        this.cameraRef = null;
-        this.cameraType = 'front';
-        this.isCapturing = false;
-        this.frameCount = 0;
-        this.capturing = false; // Lock to prevent overlapping captures
-    }
-
-    /**
-     * Start capturing and sending frames
-     * @param {object} socket - The WebSocket connection proxy
-     * @param {object} cameraRef - React ref to CameraKit Camera component
-     * @param {string} cameraType - 'front' (room/face) or 'back' (desk view)
-     */
-    start(socket, cameraRef, cameraType = 'front') {
-        if (this.isCapturing) {
-            console.log('[WSFrame] Already capturing');
-            return;
-        }
-
-        this.socket = socket;
-        this.cameraRef = cameraRef;
-        this.cameraType = cameraType;
-        this.isCapturing = true;
-        this.frameCount = 0;
-        this.capturing = false;
-
-        console.log('[WSFrame] Starting silent frame capture loop');
-        this._captureLoop();
-    }
-
-    setCameraType(cameraType) {
-        this.cameraType = cameraType;
-        console.log(`[WSFrame] Camera type now: ${cameraType}`);
-    }
-
-    async _captureLoop() {
-        while (this.isCapturing) {
-            if (!this.capturing) {
-                await this._captureAndSend();
+    start(socket, capture, getCameraType, onStatus) {
+        this.stop();
+        let stopped = false;
+        let timer;
+        let watchdog;
+        let lastStatus;
+        const update = status => {
+            if (stopped || status === lastStatus) return;
+            lastStatus = status;
+            onStatus(status);
+        };
+        const run = async () => {
+            let filePath;
+            let delay = INTERVAL_MS;
+            try {
+                if (socket.readyState !== WebSocket.OPEN) return;
+                if (socket.bufferedAmount > MAX_BUFFERED_BYTES) {
+                    update('Limited bandwidth');
+                    return;
+                }
+                const camera = getCameraType();
+                watchdog = setTimeout(() => update('Capture stalled'), 4000);
+                const image = await capture();
+                clearTimeout(watchdog);
+                if (!image?.uri) {
+                    update('Waiting for camera');
+                    return;
+                }
+                filePath = image.uri.replace(/^file:\/\//, '');
+                if (stopped || camera !== getCameraType()) return;
+                const base64 = await RNFS.readFile(filePath, 'base64');
+                if (!stopped && camera === getCameraType() && socket.readyState === WebSocket.OPEN) {
+                    const payload = JSON.stringify({ type: 'VIDEO_FRAME', data: { image: base64, camera } });
+                    delay = Math.max(delay, Math.ceil(payload.length * 1000 / BYTES_PER_SECOND));
+                    if (payload.length > MAX_MESSAGE_BYTES) {
+                        update('Frame exceeds receiver limit');
+                        return;
+                    }
+                    socket.send(payload);
+                    update('Sending frames');
+                }
+            } catch {
+                update('Capture unavailable · retrying');
+            } finally {
+                clearTimeout(watchdog);
+                if (filePath) await RNFS.unlink(filePath).catch(() => {});
+                if (!stopped) timer = setTimeout(run, delay);
             }
-            // ~5 FPS target, but adaptive: waits for capture to finish first
-            await new Promise(r => setTimeout(r, 200));
-        }
-    }
+        };
 
-    async _captureAndSend() {
-        if (!this.isCapturing || !this.cameraRef?.current) return;
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-        if (this.capturing) return; // Skip if previous capture still in progress
-
-        this.capturing = true;
-
-        try {
-            // Capture silently (shutter sound patched out of native code)
-            const result = await this.cameraRef.current.capture({
-                quality: 0.3, // Low quality = smaller files = faster
-            });
-
-            if (!result?.uri) {
-                this.capturing = false;
-                return;
-            }
-
-            // Get file path
-            let filePath = result.uri.replace('file://', '');
-
-            // Read as base64 and send
-            const base64Data = await RNFS.readFile(filePath, 'base64');
-
-            const payload = JSON.stringify({
-                type: 'VIDEO_FRAME',
-                data: { image: base64Data, camera: this.cameraType }
-            });
-            this.socket.send(payload);
-
-            this.frameCount++;
-            if (this.frameCount === 1) {
-                console.log('[WSFrame] ✅ First frame sent!');
-            } else if (this.frameCount % 50 === 0) {
-                console.log(`[WSFrame] Sent ${this.frameCount} frames`);
-            }
-
-            // Clean up temp file (fire and forget)
-            RNFS.unlink(filePath).catch(() => { });
-
-        } catch (err) {
-            if (this.frameCount % 30 === 0) {
-                console.log(`[WSFrame] Error: ${err.message}`);
-            }
-        }
-
-        this.capturing = false;
+        this.cancel = () => {
+            stopped = true;
+            clearTimeout(timer);
+            clearTimeout(watchdog);
+        };
+        timer = setTimeout(run, INITIAL_DELAY_MS);
     }
 
     stop() {
-        console.log(`[WSFrame] Stopped (${this.frameCount} frames sent)`);
-        this.isCapturing = false;
-        this.socket = null;
-        this.cameraRef = null;
-        this.frameCount = 0;
-        this.capturing = false;
+        this.cancel?.();
+        this.cancel = null;
     }
 }
 

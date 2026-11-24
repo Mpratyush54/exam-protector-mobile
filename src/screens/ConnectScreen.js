@@ -1,303 +1,142 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-    View,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    StyleSheet,
-    KeyboardAvoidingView,
-    Platform,
-    FlatList,
-    ActivityIndicator
+    ActivityIndicator, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text,
+    TextInput, TouchableOpacity, View,
 } from 'react-native';
-
-import NetInfo from '@react-native-community/netinfo';
-import DeviceInfo from 'react-native-device-info';
-
-import { scanNetworkForServer } from '../utils/networkScanner';
-import { Wifi, RefreshCcw } from 'lucide-react-native';
-import { checkTcpSupport } from '../services/socket';
+import { ChevronRight, Globe, Laptop, Radar } from 'lucide-react-native';
 import { discoverServer } from '../services/discovery';
+import NetworkStatus from '../components/NetworkStatus';
+import { palette, ui, validAddress } from '../theme';
 
-export default function ConnectScreen({ onConnect }) {
+export default function ConnectScreen({ connection, onConnect, onCancel }) {
+    const [address, setAddress] = useState(connection.address ?? '');
+    const [discovery, setDiscovery] = useState({ kind: 'idle' });
+    const [invalid, setInvalid] = useState(false);
+    const scan = useRef(null);
+    const connecting = connection.kind === 'connecting';
 
-    const [ipAddress, setIpAddress] = useState('');
-    const [scanning, setScanning] = useState(true);
-    const [foundDevices, setFoundDevices] = useState([]);
-    const [myIp, setMyIp] = useState('');
-    const [networkState, setNetworkState] = useState(null);
+    useEffect(() => () => scan.current?.abort(), []);
 
-    const isSupported = checkTcpSupport();
+    async function search() {
+        if (scan.current) return;
+        const controller = new AbortController();
+        scan.current = controller;
+        setDiscovery({ kind: 'searching' });
+        try {
+            const server = await discoverServer(controller.signal);
+            if (!controller.signal.aborted) setDiscovery(server ? { kind: 'found', server } : { kind: 'empty' });
+        } catch {
+            if (!controller.signal.aborted) setDiscovery({ kind: 'error' });
+        } finally {
+            if (scan.current === controller) scan.current = null;
+        }
+    }
 
-    useEffect(() => {
-        startScan();
-    }, []);
+    function connect(target) {
+        const host = target.trim();
+        if (connecting) return;
+        if (!validAddress(host)) {
+            setInvalid(true);
+            return;
+        }
+        setInvalid(false);
+        setAddress(host);
+        if (scan.current) {
+            scan.current.abort();
+            scan.current = null;
+            setDiscovery({ kind: 'idle' });
+        }
+        onConnect(host);
+    }
 
-    // 🔥 Get Network State (replacement for expo-network)
-    useEffect(() => {
-        const unsubscribe = NetInfo.addEventListener(state => {
-            setNetworkState(state);
-        });
-
-        return () => unsubscribe();
-    }, []);
-
-    // 🔥 Get IP Address
-    useEffect(() => {
-        const fetchIp = async () => {
-            try {
-                const ip = await DeviceInfo.getIpAddress();
-                setMyIp(ip);
-            } catch (e) {
-                console.log("IP fetch error:", e);
-            }
-        };
-
-        fetchIp();
-    }, []);
-
-    const startScan = async () => {
-        setScanning(true);
-        setFoundDevices([]);
-
-        discoverServer(3000).then(server => {
-            if (server) {
-                setFoundDevices(prev => {
-                    if (prev.some(d => d.ip === server.ip)) return prev;
-                    return [...prev, { ip: server.ip, name: `Server ${server.ip}` }];
-                });
-            }
-        });
-
-        await scanNetworkForServer(5000, (device) => {
-            setFoundDevices(prev => {
-                if (prev.some(d => d.ip === device.ip)) return prev;
-                return [...prev, device];
-            });
-        });
-
-        setScanning(false);
-    };
-
-    const handleConnect = (targetIp) => {
-        if (!targetIp) return;
-        onConnect(targetIp);
-    };
-
-    const isHotspot =
-        networkState?.type === 'cellular' ||
-        (myIp && (myIp.startsWith('192.168.43') || myIp.startsWith('172.20.10')));
-
+    const canConnect = !connecting && Boolean(address.trim());
     return (
-        <KeyboardAvoidingView
-            behavior={Platform.OS === "ios" ? "padding" : "height"}
-            style={styles.container}
-        >
-
-            <View style={styles.header}>
-                <Text style={styles.headerTitle}>Connect to Device</Text>
-
-                {scanning ? (
-                    <ActivityIndicator size="small" color="#1DB954" />
-                ) : (
-                    <TouchableOpacity onPress={startScan}>
-                        <RefreshCcw size={24} color="#1DB954" />
-                    </TouchableOpacity>
-                )}
-            </View>
-
-            {isHotspot && (
-                <View style={styles.hotspotBanner}>
-                    <Wifi size={16} color="#000" />
-                    <Text style={styles.hotspotBannerText}>
-                        Hotspot Mode Active 📡
-                    </Text>
+        <KeyboardAvoidingView style={ui.page} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <ScrollView contentContainerStyle={ui.content} keyboardShouldPersistTaps="handled">
+                <View style={styles.intro}>
+                    <Text accessibilityRole="header" style={ui.heading}>Connect your phone</Text>
+                    <Text style={ui.body}>Open Phone-Proctor on your exam computer and join the same network on both devices.</Text>
                 </View>
-            )}
 
-            <FlatList
-                data={foundDevices}
-                keyExtractor={(item) => item.ip}
-                renderItem={({ item }) => (
-                    <TouchableOpacity
-                        style={styles.deviceRow}
-                        onPress={() => handleConnect(item.ip)}
-                    >
-                        <Text style={styles.deviceName}>{item.name}</Text>
-                        <Text style={styles.deviceStatus}>{item.ip}</Text>
+                <View style={ui.section}>
+                    <Text accessibilityRole="header" style={ui.sectionLabel}>Nearby computers</Text>
+                    {discovery.kind === 'found' ? (
+                        <>
+                            <TouchableOpacity accessibilityRole="button" style={ui.item}
+                                disabled={connecting} onPress={() => connect(discovery.server)}>
+                                <View style={ui.icon}><Laptop color="white" size={17} /></View>
+                                <View style={ui.grow}>
+                                    <Text style={ui.label}>Exam computer</Text>
+                                    <Text style={ui.body}>{discovery.server}</Text>
+                                </View>
+                                <ChevronRight color={palette.muted} size={18} />
+                            </TouchableOpacity>
+                            <TouchableOpacity accessibilityRole="button" disabled={connecting} onPress={search} style={styles.textAction}>
+                                <Text style={styles.textActionLabel}>Search again</Text>
+                            </TouchableOpacity>
+                        </>
+                    ) : (
+                        <>
+                            <TouchableOpacity accessibilityRole="button" style={ui.item}
+                                accessibilityState={{ disabled: connecting || discovery.kind === 'searching', busy: discovery.kind === 'searching' }}
+                                disabled={connecting || discovery.kind === 'searching'} onPress={search}>
+                                <View style={ui.icon}><Radar color="white" size={17} /></View>
+                                <View style={ui.grow}>
+                                    <Text style={ui.label}>
+                                        {discovery.kind === 'searching' ? 'Finding computers…' : discovery.kind === 'idle' ? 'Find a computer' : 'Search again'}
+                                    </Text>
+                                    <NetworkStatus style={ui.body} />
+                                </View>
+                                {discovery.kind === 'searching'
+                                    ? <ActivityIndicator accessibilityLabel="Searching" color={palette.accent} />
+                                    : <ChevronRight color={palette.muted} size={18} />}
+                            </TouchableOpacity>
+                            {discovery.kind === 'empty' && <Text accessibilityLiveRegion="polite" style={ui.body}>
+                                No exam computer responded. Check your network or enter its address below.
+                            </Text>}
+                            {discovery.kind === 'error' && <Text accessibilityLiveRegion="polite" style={ui.error}>
+                                Discovery failed. Try again or enter the address below.
+                            </Text>}
+                        </>
+                    )}
+                </View>
+
+                <View style={ui.section}>
+                    <Text accessibilityRole="header" style={ui.sectionLabel}>Manual connection</Text>
+                    <View style={styles.inputRow}>
+                        <Globe color={palette.muted} size={17} />
+                        <TextInput accessibilityLabel="Computer address" autoCapitalize="none" autoCorrect={false}
+                            returnKeyType="go" onSubmitEditing={() => connect(address)}
+                            style={styles.input} value={address} onChangeText={value => { setAddress(value); setInvalid(false); }}
+                            placeholder="Computer address" placeholderTextColor={palette.muted} editable={!connecting} />
+                    </View>
+                    {invalid ? <Text accessibilityLiveRegion="polite" style={ui.error}>Enter a valid IPv4 address or hostname.</Text>
+                        : <Text style={ui.body}>Use the address shown on the exam computer.</Text>}
+                    {connection.kind === 'error' && <Text accessibilityLiveRegion="polite" style={ui.error}>{connection.message}</Text>}
+                </View>
+            </ScrollView>
+            <View style={ui.actionBar}>
+                <View style={ui.actionGroup}>
+                    <TouchableOpacity accessibilityRole="button"
+                        accessibilityState={{ disabled: !canConnect, busy: connecting }} disabled={!canConnect}
+                        style={[ui.button, !canConnect && ui.disabled]} onPress={() => connect(address)}>
+                        <Text style={[ui.buttonText, !canConnect && ui.disabledText]}>
+                            {connecting ? `Connecting to ${connection.address}…` : 'Connect'}
+                        </Text>
                     </TouchableOpacity>
-                )}
-            />
-
-            <View style={styles.footer}>
-                <TextInput
-                    style={styles.input}
-                    value={ipAddress}
-                    onChangeText={setIpAddress}
-                    placeholder="192.168.1.X"
-                    placeholderTextColor="#535353"
-                />
-
-                <TouchableOpacity
-                    style={styles.connectButton}
-                    onPress={() => handleConnect(ipAddress)}
-                >
-                    <Text style={styles.connectButtonText}>Connect</Text>
-                </TouchableOpacity>
+                    {connecting && <TouchableOpacity accessibilityRole="button" onPress={onCancel} style={ui.secondary}>
+                        <Text style={ui.secondaryText}>Cancel connection</Text>
+                    </TouchableOpacity>}
+                </View>
             </View>
-
         </KeyboardAvoidingView>
     );
 }
-//  component
 
 const styles = StyleSheet.create({
-    container: {
-        flex: 1,
-        backgroundColor: '#121212', // Spotify Dark
-        paddingTop: Platform.OS === 'android' ? 40 : 0,
-    },
-    header: {
-        padding: 24,
-        paddingBottom: 12,
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-    },
-    headerTitle: {
-        fontSize: 24,
-        fontWeight: 'bold',
-        color: 'white',
-    },
-    headerSubtitle: {
-        fontSize: 14,
-        color: '#B3B3B3',
-        marginTop: 4,
-    },
-    hotspotBanner: {
-        backgroundColor: '#1DB954',
-        marginHorizontal: 20,
-        padding: 12,
-        borderRadius: 8,
-        flexDirection: 'row',
-        alignItems: 'center',
-        marginBottom: 16,
-    },
-    hotspotBannerText: {
-        color: 'black',
-        fontWeight: 'bold',
-        fontSize: 12,
-        flex: 1,
-    },
-    deviceListContainer: {
-        flex: 1,
-        paddingHorizontal: 20,
-    },
-    emptyState: {
-        flex: 1,
-        alignItems: 'center',
-        justifyContent: 'center',
-        opacity: 0.7,
-    },
-    pulseCircle: {
-        position: 'absolute',
-        width: 200,
-        height: 200,
-        borderRadius: 100,
-        backgroundColor: 'rgba(29, 185, 84, 0.1)',
-        transform: [{ scale: 0.8 }],
-    },
-    pulsing: {
-        // Add pulse animation logic if needed, simplifed for now
-    },
-    emptyText: {
-        color: '#B3B3B3',
-        marginTop: 16,
-        fontSize: 16,
-    },
-    retryButton: {
-        marginTop: 20,
-        padding: 12,
-        backgroundColor: '#282828',
-        borderRadius: 20,
-    },
-    retryText: {
-        color: 'white',
-        fontWeight: 'bold',
-    },
-    deviceRow: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        paddingVertical: 16,
-        borderBottomWidth: 1,
-        borderBottomColor: '#282828',
-    },
-    iconContainer: {
-        width: 48,
-        height: 48,
-        backgroundColor: '#282828',
-        borderRadius: 8,
-        alignItems: 'center',
-        justifyContent: 'center',
-        marginRight: 16,
-    },
-    laptopIcon: {
-        width: 24,
-        height: 16,
-        borderWidth: 2,
-        borderColor: '#B3B3B3',
-        borderRadius: 2,
-    },
-    deviceInfo: {
-        flex: 1,
-    },
-    deviceName: {
-        fontSize: 16,
-        fontWeight: 'bold',
-        color: '#1DB954', // Spotify Green
-        marginBottom: 4,
-    },
-    deviceStatus: {
-        fontSize: 12,
-        color: '#B3B3B3',
-        flexDirection: 'row',
-        alignItems: 'center',
-    },
-    footer: {
-        padding: 24,
-        borderTopWidth: 1,
-        borderTopColor: '#282828',
-        backgroundColor: '#121212',
-    },
-    footerLink: {
-        color: 'white',
-        textAlign: 'center',
-        fontWeight: 'bold',
-    },
-    manualContainer: {
-        gap: 12,
-    },
-    input: {
-        backgroundColor: '#282828',
-        color: 'white',
-        padding: 16,
-        borderRadius: 8,
-        fontSize: 16,
-    },
-    connectButton: {
-        backgroundColor: 'white',
-        padding: 16,
-        borderRadius: 30, // Pill shape
-        alignItems: 'center',
-    },
-    connectButtonText: {
-        color: 'black',
-        fontWeight: 'bold',
-        fontSize: 16,
-    },
-    cancelLink: {
-        color: '#B3B3B3',
-        textAlign: 'center',
-        marginTop: 8,
-    },
+    intro: { gap: 7 },
+    inputRow: { minHeight: 48, borderColor: palette.line, borderWidth: 1, borderRadius: 9, paddingHorizontal: 13, alignItems: 'center', flexDirection: 'row', gap: 10 },
+    input: { flex: 1, minHeight: 46, color: palette.ink, fontSize: 16, paddingVertical: 8 },
+    textAction: { minHeight: 44, alignItems: 'flex-start', justifyContent: 'center' },
+    textActionLabel: { color: palette.accent, fontSize: 15, fontWeight: '600' },
 });
